@@ -182,8 +182,11 @@ class Failed(DatabaseBase):
 class Database:
     downloads: DatabaseInterface
     failed: DatabaseInterface
+    target_track_ids: set[str] | None = None
 
     def downloaded(self, item_id: str) -> bool:
+        if self.target_track_ids is not None and item_id not in self.target_track_ids:
+            return True # act as if downloaded to skip
         return self.downloads.contains(id=item_id)
 
     def set_downloaded(self, item_id: str):

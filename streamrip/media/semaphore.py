@@ -5,6 +5,20 @@ from ..config import DownloadsConfig
 
 _unlimited = nullcontext()
 _global_semaphore: None | tuple[int, asyncio.Semaphore] = None
+_global_retry_lock: asyncio.Lock | None = None
+
+
+def global_retry_lock() -> asyncio.Lock:
+    """A global lock that serializes retry attempts across all tracks.
+
+    When multiple tracks hit CDN errors simultaneously, concurrent retries
+    create burst patterns that worsen the problem. This lock ensures only
+    one track retries at a time.
+    """
+    global _global_retry_lock
+    if _global_retry_lock is None:
+        _global_retry_lock = asyncio.Lock()
+    return _global_retry_lock
 
 
 def global_download_semaphore(c: DownloadsConfig) -> asyncio.Semaphore | nullcontext:

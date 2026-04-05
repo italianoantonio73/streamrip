@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 from dataclasses import dataclass
 
 from .. import converter
@@ -13,7 +14,7 @@ from ..metadata import AlbumMetadata, Covers, TrackMetadata, tag_file
 from ..progress import add_title, get_progress_callback, remove_title
 from .artwork import download_artwork
 from .media import Media, Pending
-from .semaphore import global_download_semaphore
+from .semaphore import global_download_semaphore, global_retry_lock
 
 logger = logging.getLogger("streamrip")
 
@@ -21,7 +22,7 @@ logger = logging.getLogger("streamrip")
 @dataclass(slots=True)
 class Track(Media):
     meta: TrackMetadata
-    downloadable: Downloadable
+    downloadable: Downloadable | None
     config: Config
     folder: str
     # Is None if a cover doesn't exist for the track
@@ -30,6 +31,10 @@ class Track(Media):
     # change?
     download_path: str = ""
     is_single: bool = False
+    # For refreshing download URLs on retry (Akamai CDN rejects stale signed URLs)
+    client: Client | None = None
+    track_id: str = ""
+    quality: int = 0
 
     async def preprocess(self):
         self._set_download_path()
@@ -38,43 +43,189 @@ class Track(Media):
             add_title(self.meta.title)
 
     async def download(self):
-        # TODO: progress bar description
-        async with global_download_semaphore(self.config.session.downloads):
-            with get_progress_callback(
-                self.config.session.cli.progress_bars,
-                await self.downloadable.size(),
-                f"Track {self.meta.tracknumber}",
-            ) as callback:
-                try:
-                    await self.downloadable.download(self.download_path, callback)
-                    retry = False
-                except Exception as e:
-                    logger.error(
-                        f"Error downloading track '{self.meta.title}', retrying: {e}"
-                    )
-                    retry = True
+        max_retries = 5
+        last_error = None
 
-            if not retry:
-                return
+        for attempt in range(max_retries):
+            if attempt > 0:
+                # Serialize retries across all tracks to avoid concurrent retry storms
+                async with global_retry_lock():
+                    base_delay = min(2**attempt, 64)
+                    delay = base_delay + random.uniform(0, base_delay * 0.5)
+                    logger.warning(
+                        f"Error downloading track '{self.meta.title}' "
+                        f"(attempt {attempt + 1}/{max_retries}), "
+                        f"retrying in {delay:.0f}s: {last_error}",
+                    )
+                    await asyncio.sleep(delay)
 
-            with get_progress_callback(
-                self.config.session.cli.progress_bars,
-                await self.downloadable.size(),
-                f"Track {self.meta.tracknumber} (retry)",
-            ) as callback:
+            # Fetch or refresh download URL
+            if self.downloadable is None or attempt > 0:
+                if self.client is not None and self.track_id:
+                    try:
+                        self.downloadable = await self.client.get_downloadable(
+                            self.track_id, self.quality
+                        )
+                    except NonStreamableError:
+                        raise
+                    except Exception as e:
+                        last_error = e
+                        continue
+
+            async with global_download_semaphore(self.config.session.downloads):
+                desc = f"Track {self.meta.tracknumber}"
+                if attempt > 0:
+                    desc += f" (retry {attempt})"
+
                 try:
-                    await self.downloadable.download(self.download_path, callback)
+                    with get_progress_callback(
+                        self.config.session.cli.progress_bars,
+                        await self.downloadable.size(),
+                        desc,
+                    ) as callback:
+                        await self.downloadable.download(
+                            self.download_path, callback
+                        )
+                        return set()
                 except Exception as e:
-                    logger.error(
-                        f"Persistent error downloading track '{self.meta.title}', skipping: {e}"
-                    )
-                    self.db.set_failed(
-                        self.downloadable.source, "track", self.meta.info.id
-                    )
+                    last_error = e
+                    if os.path.exists(self.download_path):
+                        try:
+                            os.remove(self.download_path)
+                        except OSError:
+                            pass
+
+        # Try downloading an alternative version (e.g. single) with the same ISRC.
+        # Some Qobuz album tracks have broken CDN entries, but the same recording
+        # released as a single has a working CDN path.
+        alt_id = await self._find_alternative_track()
+        if alt_id is not None:
+            try:
+                self.downloadable = await self.client.get_downloadable(
+                    alt_id, self.quality,
+                )
+                async with global_download_semaphore(self.config.session.downloads):
+                    with get_progress_callback(
+                        self.config.session.cli.progress_bars,
+                        await self.downloadable.size(),
+                        f"Track {self.meta.tracknumber} (alt {alt_id})",
+                    ) as callback:
+                        await self.downloadable.download(
+                            self.download_path, callback,
+                        )
+                        logger.info(
+                            f"Downloaded '{self.meta.title}' via alternative "
+                            f"track {alt_id} (ISRC: {self.meta.isrc})",
+                        )
+                        return set()
+            except Exception as e:
+                logger.warning(f"Alternative track {alt_id} also failed: {e}")
+                if os.path.exists(self.download_path):
+                    try:
+                        os.remove(self.download_path)
+                    except OSError:
+                        pass
+
+        logger.error(
+            f"Persistent error downloading track "
+            f"'{self.meta.title}', skipping: {last_error}",
+        )
+        self.db.set_failed(
+            self.downloadable.source, "track", self.meta.info.id,
+        )
+        return {self.meta.info.id}
+
+    async def _find_alternative_track(self) -> str | None:
+        """Search for an alternative version of a failed track by ISRC.
+
+        When album tracks have broken CDN entries, the same recording
+        released as a single often has a working CDN path.  Both share
+        the same ISRC (International Standard Recording Code).
+
+        A candidate must match all of the following criteria:
+        - Same ISRC as the original track
+        - Different track ID (not the same broken entry)
+        - Streamable
+        - Same parental_warning (explicit) flag
+        - Bit depth >= the original track's bit depth
+        - Sampling rate >= the original track's sampling rate
+        """
+        if self.client is None or self.client.source != "qobuz":
+            logger.info(f"Skipping alternative search for '{self.meta.title}': no client or not qobuz")
+            return None
+        if not self.meta.isrc:
+            logger.info(f"Skipping alternative search for '{self.meta.title}': no ISRC")
+            return None
+
+        try:
+            query = f"{self.meta.title} {self.meta.artist}"
+            logger.info(
+                f"Searching for alternative track: query='{query}', "
+                f"ISRC={self.meta.isrc}, explicit={self.meta.info.explicit}"
+            )
+            pages = await self.client.search("track", query, limit=20)
+            candidates = 0
+            for page in pages:
+                items = page.get("tracks", {}).get("items", [])
+                for item in items:
+                    item_id = str(item["id"])
+                    item_isrc = item.get("isrc")
+                    item_streamable = item.get("streamable", False)
+                    item_explicit = item.get("parental_warning", False)
+                    item_bit_depth = item.get("maximum_bit_depth")
+                    item_sampling_rate = item.get("maximum_sampling_rate")
+                    if item_isrc == self.meta.isrc and item_id != self.meta.info.id:
+                        candidates += 1
+                        if not item_streamable:
+                            logger.info(
+                                f"Alternative candidate {item_id} rejected: not streamable"
+                            )
+                        elif item_explicit != self.meta.info.explicit:
+                            logger.info(
+                                f"Alternative candidate {item_id} rejected: "
+                                f"explicit mismatch (track={self.meta.info.explicit}, "
+                                f"candidate={item_explicit})"
+                            )
+                        elif (
+                            self.meta.info.bit_depth is not None
+                            and item_bit_depth is not None
+                            and item_bit_depth < self.meta.info.bit_depth
+                        ):
+                            logger.info(
+                                f"Alternative candidate {item_id} rejected: "
+                                f"bit depth {item_bit_depth} < {self.meta.info.bit_depth}"
+                            )
+                        elif (
+                            self.meta.info.sampling_rate is not None
+                            and item_sampling_rate is not None
+                            and item_sampling_rate < self.meta.info.sampling_rate
+                        ):
+                            logger.info(
+                                f"Alternative candidate {item_id} rejected: "
+                                f"sampling rate {item_sampling_rate} < {self.meta.info.sampling_rate}"
+                            )
+                        else:
+                            logger.info(
+                                f"Found alternative track {item_id} for "
+                                f"'{self.meta.title}' (ISRC: {self.meta.isrc}, "
+                                f"bit_depth={item_bit_depth}, "
+                                f"sampling_rate={item_sampling_rate})",
+                            )
+                            return item_id
+            logger.info(
+                f"No alternative found for '{self.meta.title}' "
+                f"(ISRC: {self.meta.isrc}, {candidates} ISRC match(es) rejected)"
+            )
+        except Exception as e:
+            logger.warning(f"Alternative track search failed: {e}")
+        return None
 
     async def postprocess(self):
         if self.is_single:
             remove_title(self.meta.title)
+
+        if not os.path.exists(self.download_path):
+            return
 
         await tag_file(self.download_path, self.meta, self.cover_path)
         if self.config.session.conversion.enabled:
@@ -147,6 +298,7 @@ class PendingTrack(Pending):
             return None
 
         quality = self.config.session.get_source(source).quality
+        downloadable = None
         try:
             downloadable = await self.client.get_downloadable(self.id, quality)
         except NonStreamableError as e:
@@ -154,6 +306,11 @@ class PendingTrack(Pending):
                 f"Error getting downloadable data for track {meta.tracknumber} [{self.id}]: {e}"
             )
             return None
+        except Exception as e:
+            logger.warning(
+                f"Transient error getting download URL for track "
+                f"{meta.tracknumber} [{self.id}], will retry during download: {e}"
+            )
 
         downloads_config = self.config.session.downloads
         if downloads_config.disc_subdirectories and self.album.disctotal > 1:
@@ -168,6 +325,9 @@ class PendingTrack(Pending):
             folder,
             self.cover_path,
             self.db,
+            client=self.client,
+            track_id=self.id,
+            quality=quality,
         )
 
 
@@ -246,6 +406,9 @@ class PendingSingle(Pending):
             embedded_cover_path,
             self.db,
             is_single=True,
+            client=self.client,
+            track_id=self.id,
+            quality=quality,
         )
 
     def _format_folder(self, meta: AlbumMetadata) -> str:

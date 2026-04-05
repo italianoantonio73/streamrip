@@ -22,6 +22,7 @@ from ..media import (
 )
 from ..metadata import SearchResults
 from ..progress import clear_progress
+from ..state import SessionState
 from .parse_url import parse_url
 from .prompter import get_prompter
 
@@ -42,12 +43,14 @@ class Main:
     User input (urls) -> Main --> Download files & Output messages to terminal
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, session_state: SessionState | None = None, target_track_ids: set[str] | None = None):
         # Data pipeline:
         # input URL -> (URL) -> (Pending) -> (Media) -> (Downloadable) -> audio file
         self.pending: list[Pending] = []
         self.media: list[Media] = []
         self.config = config
+        self.session_state = session_state or SessionState()
+        self.target_track_ids = target_track_ids
         self.clients: dict[str, Client] = {
             "qobuz": QobuzClient(config),
             "tidal": TidalClient(config),
@@ -68,7 +71,7 @@ class Main:
         else:
             failed_downloads_db = db.Dummy()
 
-        self.database = db.Database(downloads_db, failed_downloads_db)
+        self.database = db.Database(downloads_db, failed_downloads_db, target_track_ids)
 
     async def add(self, url: str):
         """Add url as a pending item.
@@ -83,17 +86,20 @@ class Main:
         self.pending.append(
             await parsed.into_pending(client, self.config, self.database),
         )
+        self.session_state.add_request("url", "url", url)
         logger.debug("Added url=%s", url)
 
     async def add_by_id(self, source: str, media_type: str, id: str):
         client = await self.get_logged_in_client(source)
         self._add_by_id_client(client, media_type, id)
+        self.session_state.add_request(source, media_type, id)
 
     async def add_all_by_id(self, info: list[tuple[str, str, str]]):
         sources = set(s for s, _, _ in info)
         clients = {s: await self.get_logged_in_client(s) for s in sources}
         for source, media_type, id in info:
             self._add_by_id_client(clients[source], media_type, id)
+            self.session_state.add_request(source, media_type, id)
 
     def _add_by_id_client(self, client: Client, media_type: str, id: str):
         if media_type == "track":
@@ -130,6 +136,8 @@ class Main:
             ],
         )
         self.pending.extend(pendings)
+        for url in urls:
+            self.session_state.add_request("url", "url", url)
 
     async def get_logged_in_client(self, source: str):
         """Return a functioning client instance for `source`."""
@@ -174,11 +182,23 @@ class Main:
             if isinstance(result, Exception):
                 logger.error(f"Error processing media item: {result}")
                 failed_items += 1
+            elif isinstance(result, set):
+                self.session_state.failed_track_ids.update(result)
+
+        total_failed_tracks = len(self.session_state.failed_track_ids)
+        if total_failed_tracks > 0:
+            self.session_state.save()
+            console.print(
+                f"\n[red]{total_failed_tracks} tracks failed to download.[/red] To retry these tracks, "
+                f"download this session again with [bold cyan]rip resume {self.session_state.id}[/bold cyan]"
+            )
+        else:
+            self.session_state.clear()
 
         if failed_items > 0:
             total_items = len(self.media)
             logger.info(
-                f"Download completed with {failed_items} failed items out of {total_items} total items."
+                f"Download completed with {failed_items} failed media items out of {total_items} total media items."
             )
 
     async def search_interactive(self, source: str, media_type: str, query: str):
@@ -288,6 +308,7 @@ class Main:
 
         if playlist is not None:
             self.media.append(playlist)
+            self.session_state.add_request("lastfm", "playlist", playlist_url)
 
     async def __aenter__(self):
         return self

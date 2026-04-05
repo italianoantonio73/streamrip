@@ -477,5 +477,113 @@ async def latest_streamrip_version(verify_ssl: bool = True) -> tuple[str, str | 
     return version, notes
 
 
+
+@rip.command()
+@click.argument("uuid_str", required=False, default=None)
+@click.option(
+    "-l",
+    "--list",
+    "list_sessions",
+    is_flag=True,
+    help="List all available resume sessions.",
+)
+@click.option(
+    "--clear",
+    is_flag=True,
+    help="Remove all saved resume sessions.",
+)
+@click.pass_context
+@coro
+async def resume(ctx, uuid_str, list_sessions, clear):
+    """Resume a previously failed download session."""
+    from ..state import SESSIONS_DIR, SessionState
+
+    if uuid_str == "list":
+        list_sessions = True
+        uuid_str = None
+    elif uuid_str == "clear":
+        clear = True
+        uuid_str = None
+
+    if clear:
+        if not os.path.isdir(SESSIONS_DIR):
+            console.print("No sessions to clear.")
+            return
+        files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
+        if not files:
+            console.print("No sessions to clear.")
+            return
+        for f in files:
+            os.remove(os.path.join(SESSIONS_DIR, f))
+        console.print(f"Cleared {len(files)} session(s).")
+        return
+
+    if list_sessions:
+        if not os.path.isdir(SESSIONS_DIR):
+            console.print("No sessions found.")
+            return
+        files = sorted(
+            (f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")),
+            key=lambda f: os.path.getmtime(os.path.join(SESSIONS_DIR, f)),
+            reverse=True,
+        )
+        if not files:
+            console.print("No sessions found.")
+            return
+        for f in files:
+            sid = f.removesuffix(".json")
+            try:
+                s = SessionState.load(sid)
+                n_failed = len(s.failed_track_ids)
+                reqs = ", ".join(r.split(" ", 2)[-1] for r in s.original_requests) or "(none)"
+                console.print(f"  [cyan]{sid}[/cyan]  {n_failed} failed track(s)  {reqs}")
+            except Exception:
+                console.print(f"  [cyan]{sid}[/cyan]  (could not load)")
+        return
+
+    if uuid_str is None:
+        console.print("[red]Usage: rip resume <session-id> or rip resume --list[/red]")
+        return
+
+    if ctx.obj["config"] is None:
+        return
+
+    try:
+        session_state = SessionState.load(uuid_str)
+    except FileNotFoundError:
+        console.print(f"[red]Session {uuid_str} not found.[/red]")
+        return
+
+    try:
+        with ctx.obj["config"] as cfg:
+            target_track_ids = set(session_state.failed_track_ids)
+            async with Main(cfg, session_state=session_state, target_track_ids=target_track_ids) as main:
+                console.print(f"[cyan]Resuming session {uuid_str}[/cyan]")
+
+                # We need to process the original requests.
+                for req in session_state.original_requests:
+                    source, media_type, item_id = req.split(" ", 2)
+                    if source == "url":
+                        await main.add(item_id)
+                    elif source == "lastfm":
+                        await main.resolve_lastfm(item_id)
+                    else:
+                        await main.add_by_id(source, media_type, item_id)
+
+                # Clear the failed tracks from state so we can re-evaluate
+                session_state.failed_track_ids.clear()
+
+                await main.resolve()
+                await main.rip()
+
+                if not session_state.failed_track_ids:
+                    console.print("[green]Session completed successfully![/green]")
+    except aiohttp.ClientConnectorCertificateError as e:
+        from ..utils.ssl_utils import print_ssl_error_help
+        console.print(f"[red]SSL Certificate verification error: {e}[/red]")
+        print_ssl_error_help()
+
+
+
 if __name__ == "__main__":
     rip()

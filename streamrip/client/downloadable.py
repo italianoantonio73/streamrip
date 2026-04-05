@@ -53,6 +53,7 @@ async def fast_async_download(path, url, headers, callback):
             headers=headers,
             allow_redirects=True,
             stream=True,
+            timeout=(10, 60),
         ) as resp:
             for chunk in resp.iter_content(chunk_size=chunk_size):
                 file.write(chunk)

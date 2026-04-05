@@ -124,6 +124,14 @@ Download a last.fm playlist using the lastfm command
 rip lastfm https://www.last.fm/user/nathan3895/playlists/12126195
 ```
 
+Resume a failed download session. If some tracks fail after all retries are exhausted, streamrip saves a session that can be resumed later (e.g. after switching VPN servers).
+
+```bash
+rip resume --list            # list saved sessions
+rip resume <session-id>      # retry failed tracks from a session
+rip resume --clear           # delete all saved sessions
+```
+
 For more customization, see the config file
 
 ```

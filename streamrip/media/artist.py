@@ -38,32 +38,31 @@ class Artist(Media):
             console.log(
                 "Resolving [purple]ALL[/purple] artist albums to detect repeats. This may take a while."
             )
-            await self._resolve_then_download(filter_conf)
+            return await self._resolve_then_download(filter_conf)
         else:
-            await self._download_async(filter_conf)
+            return await self._download_async(filter_conf)
 
     async def postprocess(self):
         pass
 
-    async def _resolve_then_download(self, filters: QobuzDiscographyFilterConfig):
-        """Resolve all artist albums, then download.
-
-        This is used if the repeat filter is turned on, since we need the titles
-        of all albums to remove repeated items.
-        """
+    async def _resolve_then_download(self, filters: QobuzDiscographyFilterConfig) -> set[str]:
         resolved_or_none: list[Album | None] = await asyncio.gather(
             *[album.resolve() for album in self.albums]
         )
         resolved = [a for a in resolved_or_none if a is not None]
         filtered_albums = self._apply_filters(resolved, filters)
         batches = self.batch([a.rip() for a in filtered_albums], RESOLVE_CHUNK_SIZE)
+        failed_tracks = set()
         for batch in batches:
-            await asyncio.gather(*batch)
+            results = await asyncio.gather(*batch, return_exceptions=True)
+            for res in results:
+                if isinstance(res, set):
+                    failed_tracks.update(res)
+        return failed_tracks
 
-    async def _download_async(self, filters: QobuzDiscographyFilterConfig):
-        async def _rip(item: PendingAlbum):
+    async def _download_async(self, filters: QobuzDiscographyFilterConfig) -> set[str]:
+        async def _rip(item: PendingAlbum) -> set[str]:
             album = await item.resolve()
-            # Skip if album doesn't pass the filter
             if (
                 album is None
                 or (filters.extras and not self._extras(album))
@@ -71,15 +70,20 @@ class Artist(Media):
                 or (filters.non_studio_albums and not self._non_studio_albums(album))
                 or (filters.non_remaster and not self._non_remaster(album))
             ):
-                return
-            await album.rip()
+                return set()
+            return await album.rip()
 
         batches = self.batch(
             [_rip(album) for album in self.albums],
             RESOLVE_CHUNK_SIZE,
         )
+        failed_tracks = set()
         for batch in batches:
-            await asyncio.gather(*batch)
+            results = await asyncio.gather(*batch, return_exceptions=True)
+            for res in results:
+                if isinstance(res, set):
+                    failed_tracks.update(res)
+        return failed_tracks
 
     def _apply_filters(
         self, albums: list[Album], filt: QobuzDiscographyFilterConfig
